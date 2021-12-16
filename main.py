@@ -1,37 +1,89 @@
 import random
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torchtext.legacy.data import Field, BucketIterator
+from torchtext.legacy.data import Field
 
-from utils import translate_sentence, bleu, save_checkpoint, load_checkpoint
+from utils import save_checkpoint, load_checkpoint
 
 
+############################
+## load and tokenize data ##
+############################
 def tokenize_per(text):
-    return [tok.text for tok in text.split(" ")]
+    return [tok for tok in text.replace("\r\n", " ").split(" ")]
 
 
 persian = Field(tokenize=tokenize_per, lower=True, init_token="<sos>", eos_token="<eos>")
+file_name = 'ferdosi.txt'
+# url = 'https://github.com/amirmosio/ferdosi-poem-generator/raw/main/ferdosi.txt'
+# path = torch_text_utils.download_from_url(url)
+poems_sentences = np.array(open(file_name, 'rb').read().decode('utf-8').split("\r\n"))
+seed_generator = torch.Generator().manual_seed(42)
+train_poems_ids, test_poems_ids = torch.utils.data.random_split(range(len(poems_sentences) - 1),
+                                                                [len(poems_sentences) - 11, 10],
+                                                                generator=seed_generator)
+persian.build_vocab(poems_sentences[train_poems_ids], max_size=10000, min_freq=2)
 
-url = 'http://github.com/amirmosio/validation.tar.gz'
-path = torchtext.utils.download_from_url(url)
-file = open(path, 'rb').read()
+######################
+### configuration ####
+######################
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+load_model = False
+save_model = True
 
-persian.build_vocab(train_data, max_size=10000, min_freq=2)
+num_epochs = 100
+learning_rate = 0.01
+batch_size = 60
+
+input_size_encoder = len(persian.vocab)
+input_size_decoder = len(persian.vocab)
+output_size = len(persian.vocab)
+encoder_embedding_size = 300
+decoder_embedding_size = 300
+hidden_size = 1024
+num_layers = 1
+enc_dropout = 0.0
+dec_dropout = 0.0
+
+
+######################
+####### models #######
+######################
+
+class PoemsDataset:
+    def __init__(self, data, ids):
+        self.data = data
+        self.length = len(ids) - 1
+        self.ids = ids
+
+    def get_batches(self, batch_size):
+        num_batches = int(np.ceil(self.length / batch_size))
+
+        indices = torch.randperm(self.length)
+
+        first = np.array([self.data[i] for i in self.ids])[indices]
+        second = np.array([self.data[i + 1] for i in self.ids])[indices]
+
+        for batch in range(num_batches):
+            f = first[batch * batch_size: min((batch + 1) * batch_size, self.length)]
+            s = second[batch * batch_size: min((batch + 1) * batch_size, self.length)]
+            yield batch, f, s
 
 
 class Encoder(nn.Module):
     def __init__(self, input_size, embedding_size, hidden_size, num_layers, p):
         super(Encoder, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
+
         self.embedding = nn.Embedding(input_size, embedding_size)
+        self.dropout = nn.Dropout(p)
         self.rnn = nn.LSTM(embedding_size, hidden_size, num_layers, bidirectional=True)
         self.fc_hidden = nn.Linear(hidden_size * 2, hidden_size)
         self.fc_cell = nn.Linear(hidden_size * 2, hidden_size)
-        self.dropout = nn.Dropout(p)
 
     def forward(self, x):
         embedding = self.dropout(self.embedding(x))
@@ -44,19 +96,16 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(
-            self, input_size, embedding_size, hidden_size, output_size, num_layers, p
-    ):
+    def __init__(self, input_size, embedding_size, hidden_size, output_size, num_layers, p):
         super(Decoder, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
+
         self.embedding = nn.Embedding(input_size, embedding_size)
-        self.rnn = nn.LSTM(hidden_size * 2 + embedding_size, hidden_size, num_layers)
-        self.energy = nn.Linear(hidden_size * 3, 1)
-        self.fc = nn.Linear(hidden_size, output_size)
         self.dropout = nn.Dropout(p)
-        self.softmax = nn.Softmax(dim=0)
+        self.energy = nn.Linear(hidden_size * 3, 1)
         self.relu = nn.ReLU()
+        self.softmax = nn.Softmax(dim=0)
+        self.rnn = nn.LSTM(hidden_size * 2 + embedding_size, hidden_size, num_layers)
+        self.fc = nn.Linear(hidden_size, output_size)
 
     def forward(self, x, encoder_states, hidden, cell):
         x = x.unsqueeze(0)
@@ -105,54 +154,41 @@ class Seq2Seq(nn.Module):
         return outputs
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-load_model = False
-save_model = True
-
-num_epochs = 100
-learning_rate = 3e-4
-batch_size = 32
-
-input_size_encoder = len(persian.vocab)
-input_size_decoder = len(persian.vocab)
-output_size = len(persian.vocab)
-encoder_embedding_size = 300
-decoder_embedding_size = 300
-hidden_size = 1024
-num_layers = 1
-enc_dropout = 0.0
-dec_dropout = 0.0
-
 writer = SummaryWriter(f"runs/loss_plot")
-step = 0
-train_iterator, valid_iterator, test_iterator = BucketIterator.splits(
-    (train_data, valid_data, test_data),
-    batch_size=batch_size,
-    sort_within_batch=True,
-    sort_key=lambda x: len(x.src),
-    device=device,
-)
-encoder_net = Encoder(
-    input_size_encoder, encoder_embedding_size, hidden_size, num_layers, enc_dropout
-).to(device)
-decoder_net = Decoder(
-    input_size_decoder,
-    decoder_embedding_size,
-    hidden_size,
-    output_size,
-    num_layers,
-    dec_dropout,
-).to(device)
+train_dataset = PoemsDataset(poems_sentences, train_poems_ids)
+test_dataset = PoemsDataset(poems_sentences, test_poems_ids)
+# train_iterator = DataLoader(PoemsDataset(train_poems_sentences), batch_size=batch_size, shuffle=True)
+# test_iterator = DataLoader(PoemsDataset(test_poems_sentences), batch_size=batch_size, shuffle=True)
+
+# train_iterator = BucketIterator(
+#     train_poems_sentences,
+#     batch_size,
+#     sort_within_batch=True,
+#     sort_key=lambda x: len(x[0]),
+#     device=device,
+# )
+# test_iterator = BucketIterator(
+#     test_poems_sentences,
+#     batch_size,
+#     sort_within_batch=True,
+#     sort_key=lambda x: len(x[0]),
+#     device=device,
+# )
+# train_iterator.create_batches()
+# test_iterator.create_batches()
+
+# initializing models
+encoder_net = Encoder(input_size_encoder, encoder_embedding_size, hidden_size, num_layers, enc_dropout).to(device)
+decoder_net = Decoder(input_size_decoder, decoder_embedding_size, hidden_size, output_size, num_layers, dec_dropout).to(
+    device)
 model = Seq2Seq(encoder_net, decoder_net).to(device)
+# optimizer
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
 pad_idx = persian.vocab.stoi["<pad>"]
 criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
 if load_model:
     load_checkpoint(torch.load("my_checkpoint.pth.tar"), model, optimizer)
-sentence = (
-    "ein boot mit mehreren männern darauf wird von einem großen"
-    "pferdegespann ans ufer gezogen."
-)
 for epoch in range(num_epochs):
     print(f"[Epoch {epoch} / {num_epochs}]")
     if save_model:
@@ -161,15 +197,11 @@ for epoch in range(num_epochs):
             "optimizer": optimizer.state_dict(),
         }
         save_checkpoint(checkpoint)
-    model.eval()
-    translated_sentence = translate_sentence(
-        model, sentence, persian, persian, device, max_length=50
-    )
-    print(f"Translated example sentence: \n {translated_sentence}")
+
     model.train()
-    for batch_idx, batch in enumerate(train_iterator):
-        inp_data = batch.src.to(device)
-        target = batch.trg.to(device)
+    for batch in train_dataset.get_batches(batch_size):
+        inp_data = batch[1]
+        target = batch[2]
 
         output = model(inp_data, target)
 
@@ -184,8 +216,7 @@ for epoch in range(num_epochs):
 
         optimizer.step()
 
-        writer.add_scalar("Training loss", loss, global_step=step)
-        step += 1
+        writer.add_scalar("Training loss", loss, global_step=epoch)
 
-score = bleu(test_data[1:100], model, persian, persian, device)
-print(f"Bleu score {score * 100:.2f}")
+# score = bleu(test_data[1:100], model, persian, persian, device)
+# print(f"Bleu score {score * 100:.2f}")
