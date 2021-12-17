@@ -15,7 +15,7 @@ from utils import save_checkpoint, load_checkpoint
 ## load and tokenize data ##
 ############################
 def tokenize_per(text):
-    return [tok for tok in text.replace("\r\n", " ").split(" ")]
+    return np.array([tok for tok in text.replace("\r\n", " ").split(" ")])
 
 
 persian = Field(tokenize=tokenize_per, lower=True, init_token="<sos>", eos_token="<eos>")
@@ -23,11 +23,23 @@ file_name = 'ferdosi.txt'
 # url = 'https://github.com/amirmosio/ferdosi-poem-generator/raw/main/ferdosi.txt'
 # path = torch_text_utils.download_from_url(url)
 poems_sentences = np.array(open(file_name, 'rb').read().decode('utf-8').split("\r\n"))
+poems_tokens = np.array([tokenize_per(sent) for sent in poems_sentences])
 seed_generator = torch.Generator().manual_seed(42)
 train_poems_ids, test_poems_ids = torch.utils.data.random_split(range(len(poems_sentences) - 1),
                                                                 [len(poems_sentences) - 11, 10],
                                                                 generator=seed_generator)
-persian.build_vocab(poems_sentences[train_poems_ids], max_size=10000, min_freq=2)
+persian.build_vocab(poems_tokens[train_poems_ids], max_size=10000, min_freq=2)
+
+
+def convert_sentence_tokens_to_vectors(array):
+    res = np.zeros((array.shape[0], len(persian.vocab)))
+    for token_idx in range(array.shape[0]):
+        vocab_index = persian.vocab[array[token_idx]]
+        res[token_idx][vocab_index] = 1
+    return res
+
+
+# poems_vectors = convert_sentence_tokens_to_vectors(poems_tokens[0])
 
 ######################
 ### configuration ####
@@ -136,10 +148,10 @@ class Seq2Seq(nn.Module):
         self.decoder = decoder
 
     def forward(self, source, target, teacher_force_ratio=0.5):
-        batch_size = source.shape[1]
+        batch_size = source.shape[0]
         target_len = target.shape[0]
         target_vocab_size = len(persian.vocab)
-        outputs = torch.zeros(target_len, batch_size, target_vocab_size).to(device)
+        outputs = torch.zeros(batch_size, target_len, target_vocab_size).to(device)
         encoder_states, hidden, cell = self.encoder(source)
 
         x = target[0]
@@ -155,27 +167,9 @@ class Seq2Seq(nn.Module):
 
 
 writer = SummaryWriter(f"runs/loss_plot")
+
 train_dataset = PoemsDataset(poems_sentences, train_poems_ids)
 test_dataset = PoemsDataset(poems_sentences, test_poems_ids)
-# train_iterator = DataLoader(PoemsDataset(train_poems_sentences), batch_size=batch_size, shuffle=True)
-# test_iterator = DataLoader(PoemsDataset(test_poems_sentences), batch_size=batch_size, shuffle=True)
-
-# train_iterator = BucketIterator(
-#     train_poems_sentences,
-#     batch_size,
-#     sort_within_batch=True,
-#     sort_key=lambda x: len(x[0]),
-#     device=device,
-# )
-# test_iterator = BucketIterator(
-#     test_poems_sentences,
-#     batch_size,
-#     sort_within_batch=True,
-#     sort_key=lambda x: len(x[0]),
-#     device=device,
-# )
-# train_iterator.create_batches()
-# test_iterator.create_batches()
 
 # initializing models
 encoder_net = Encoder(input_size_encoder, encoder_embedding_size, hidden_size, num_layers, enc_dropout).to(device)
