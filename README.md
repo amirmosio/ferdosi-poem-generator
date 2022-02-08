@@ -1,1 +1,1 @@
-# ferdosi-poem-generator
+# Ferdosi Poem Generator Using RNN
